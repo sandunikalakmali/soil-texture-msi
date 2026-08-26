@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the published IEEE Access article."
+title: "Soil Texture MSI: official research software"
+type: software
+authors:
+  - given-names: "G. A. S. L."
+    family-names: Ranasinghe
+  - given-names: "J. A. S. T."
+    family-names: Jayakody
+  - given-names: "M. C. L."
+    family-names: De Silva
+  - given-names: "G."
+    family-names: Thilakarathne
+  - given-names: "G. M. R. I."
+    family-names: Godaliyadda
+  - given-names: "H. M. V. R."
+    family-names: Herath
+  - given-names: "M. P. B."
+    family-names: Ekanayake
+  - given-names: "S. K."
+    family-names: Navaratnarajah
+repository-code: "https://github.com/sandunikalakmali/soil-texture-msi"
+license: MIT
+preferred-citation:
+  type: article
+  title: "Reflectance Multispectral Imaging for Soil Grain-Size Composition Estimation and USDA Texture Classification"
+  authors:
+    - given-names: "G. A. S. L."
+      family-names: Ranasinghe
+    - given-names: "J. A. S. T."
+      family-names: Jayakody
+    - given-names: "M. C. L."
+      family-names: De Silva
+    - given-names: "G."
+      family-names: Thilakarathne
+    - given-names: "G. M. R. I."
+      family-names: Godaliyadda
+    - given-names: "H. M. V. R."
+      family-names: Herath
+    - given-names: "M. P. B."
+      family-names: Ekanayake
+    - given-names: "S. K."
+      family-names: Navaratnarajah
+  journal: IEEE Access
+  volume: 14
+  start: 128744
+  end: 128763
+  year: 2026
+  doi: "10.1109/ACCESS.2026.3721276"

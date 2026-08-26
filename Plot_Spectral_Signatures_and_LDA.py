@@ -1,9 +1,15 @@
-"""Generate the spectral-signature and LDA visualizations (Figures 8--11).
+"""Generate the spectral-signature and qualitative LDA Figures 8--11.
 
 The input is the Training CSV produced by Make_Datafiles.py. Figures are saved
-under outputs/04_Spectral_Signatures_and_LDA.
+under outputs/05_Visualizations. The whole-dataset LDA fits here are strictly
+for qualitative visualization; evaluation scripts fit LDA inside each fold.
+
+The final paper's shaded signature regions are not defined in its caption or
+the original repository history. This script therefore does not invent a
+standard deviation/error/confidence interpretation.
 """
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,8 +17,19 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import MinMaxScaler
+
+from scientific_utils import (
+    EXPECTED_DATASETS,
+    FEATURE_COLUMNS,
+    LABEL_COLUMN,
+    SPECIMEN_COLUMN,
+    TARGET_COLUMNS,
+    grouped_specimen_truth,
+    require_finite,
+    specimen_ids_from_dataframe,
+    validate_block_dataset,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TRAIN_CSV_PATH = (
@@ -22,24 +39,9 @@ TRAIN_CSV_PATH = (
     / "dataAll_Soil_Composition_Training_Histogram_No_Augmentation_"
     "Adjusted_Files_1crop_0_03_sigma_subOperator_SuperPixel.csv"
 )
-OUTPUT_DIR = SCRIPT_DIR / "outputs" / "04_Spectral_Signatures_and_LDA"
+OUTPUT_DIR = SCRIPT_DIR / "outputs" / "05_Visualizations"
 
-BAND_COLS = [
-    "365",
-    "405",
-    "473",
-    "530",
-    "575",
-    "621",
-    "660",
-    "735",
-    "770",
-    "830",
-    "850",
-    "890",
-    "940",
-]
-BLOCKS_PER_SPECIMEN = 100
+BAND_COLS = list(FEATURE_COLUMNS)
 
 SOILTYPE_GROUPS = {
     "Sand group": ["Sand"],
@@ -138,18 +140,6 @@ def composition_labels(df):
     return "Cl" + clay + "-M" + silt + "-S" + sand
 
 
-def validate_input(df):
-    required = BAND_COLS + ["Clay", "Sand", "Silt", "Soil_Type"]
-    missing = [column for column in required if column not in df.columns]
-    if missing:
-        raise ValueError(f"Training CSV is missing required columns: {missing}")
-    if len(df) % BLOCKS_PER_SPECIMEN:
-        raise ValueError(
-            f"CSV has {len(df)} rows, which is not divisible by "
-            f"BLOCKS_PER_SPECIMEN={BLOCKS_PER_SPECIMEN}."
-        )
-
-
 def validate_color_coverage(labels, color_map, label_kind):
     missing = sorted(set(labels) - set(color_map))
     if missing:
@@ -158,20 +148,9 @@ def validate_color_coverage(labels, color_map, label_kind):
         )
 
 
-def make_specimen_table(df):
-    """Average each contiguous 100-row block into one physical specimen."""
-    work = df.copy()
-    work["Specimen_ID"] = np.arange(len(work)) // BLOCKS_PER_SPECIMEN
-    aggregations = {band: "mean" for band in BAND_COLS}
-    aggregations.update(
-        {
-            "Clay": "first",
-            "Sand": "first",
-            "Silt": "first",
-            "Soil_Type": "first",
-        }
-    )
-    specimen_df = work.groupby("Specimen_ID", sort=True).agg(aggregations)
+def make_specimen_table(df, groups):
+    """Average block observations using explicit physical-specimen IDs."""
+    specimen_df = grouped_specimen_truth(df, groups)
     specimen_df["Composition"] = composition_labels(specimen_df)
     return specimen_df
 
@@ -223,8 +202,11 @@ def plot_lda(df, labels, groups, color_map, legend_title, output_path):
     labels = pd.Series(labels, index=df.index).astype(str).to_numpy()
     validate_color_coverage(np.unique(labels), color_map, legend_title)
 
-    imputed = SimpleImputer(strategy="median").fit_transform(df[BAND_COLS])
-    X_scaled = MinMaxScaler().fit_transform(imputed)
+    # Whole-dataset fitting is appropriate only for these qualitative figures.
+    # Performance evaluation uses FoldPreprocessor on training folds only.
+    X_scaled = MinMaxScaler().fit_transform(
+        require_finite(df[BAND_COLS].to_numpy(dtype=float), "visualization features")
+    )
     lda = LinearDiscriminantAnalysis(n_components=2)
     projected = lda.fit_transform(X_scaled, labels)
 
@@ -278,18 +260,24 @@ def plot_lda(df, labels, groups, color_map, legend_title, output_path):
     plt.close(fig)
 
 
-def main():
-    if not TRAIN_CSV_PATH.is_file():
+def main(train_csv=TRAIN_CSV_PATH, output_dir=OUTPUT_DIR, strict_dimensions=True):
+    if not train_csv.is_file():
         raise FileNotFoundError(
-            f"Training CSV not found: {TRAIN_CSV_PATH}\n"
+            f"Training CSV not found: {train_csv}\n"
             "Run Make_Datafiles.py first to create it."
         )
 
-    df = pd.read_csv(TRAIN_CSV_PATH)
-    validate_input(df)
+    df = pd.read_csv(train_csv)
+    groups = specimen_ids_from_dataframe(df, dataset_name="training/testing")
+    validate_block_dataset(
+        df,
+        groups,
+        dataset_name="training/testing",
+        expected=EXPECTED_DATASETS["training/testing"] if strict_dimensions else None,
+    )
     df["Composition"] = composition_labels(df)
-    specimen_df = make_specimen_table(df)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    specimen_df = make_specimen_table(df, groups)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     outputs = {
         "Figure_08_Spectral_Signatures_USDA_Classes.png": lambda path: plot_signatures(
@@ -327,10 +315,19 @@ def main():
     }
 
     for filename, create_figure in outputs.items():
-        output_path = OUTPUT_DIR / filename
+        output_path = output_dir / filename
         create_figure(output_path)
         print(f"Saved: {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--train-csv", type=Path, default=TRAIN_CSV_PATH)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--allow-nonofficial-dimensions", action="store_true")
+    arguments = parser.parse_args()
+    main(
+        arguments.train_csv,
+        arguments.output_dir,
+        strict_dimensions=not arguments.allow_nonofficial_dimensions,
+    )

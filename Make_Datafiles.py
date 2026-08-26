@@ -1,4 +1,11 @@
-"""Create processed Training and Validation images and their feature CSV files."""
+"""Create the paper's block-feature CSVs from raw multispectral images.
+
+The uint8 conversion before block averaging is intentionally preserved from
+the result-generating repository implementation. It is a quantization step in
+the published-result reproduction path, not part of the mathematical tanh
+mapping itself; floating-point arrays should be used in future experiments
+only as an explicitly versioned methodological variant.
+"""
 
 from pathlib import Path
 
@@ -6,17 +13,25 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from scientific_utils import (
+    BLOCKS_PER_SPECIMEN,
+    EXPECTED_DATASETS,
+    FEATURE_COLUMNS,
+    LABEL_COLUMN,
+    SPECIMEN_COLUMN,
+    TARGET_COLUMNS,
+    WAVELENGTHS_NM,
+)
+from usda_texture import classify_usda_texture
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "Data"
 IMAGES_DIR = DATA_DIR / "Images"
 DATA_FILES_DIR = DATA_DIR / "Data_files"
 
-SLOPE = 0.03
-WAVELENGTHS = [
-    "365", "405", "473", "530", "575", "621", "660",
-    "735", "770", "830", "850", "890", "940",
-]
+TANH_KAPPA = 0.03
+WAVELENGTHS = list(FEATURE_COLUMNS)
 REGION = (775, 875, 350, 450)  # y1, y2, x1, x2
 BLOCK_SIZE = 10
 
@@ -29,53 +44,6 @@ CSV_SUFFIX = (
 CLAY_SOURCE = {"Clay": 78.634, "Sand": 0.000, "Silt": 21.366}
 SAND_SOURCE = {"Clay": 0.000, "Sand": 100.000, "Silt": 0.000}
 SILT_SOURCE = {"Clay": 5.750, "Sand": 0.000, "Silt": 94.250}
-
-
-def classify_usda_soil_texture(clay, sand, silt):
-    """Return the USDA texture class after normalizing composition to 100%."""
-    total = clay + sand + silt
-    if total == 0:
-        return "Unknown"
-
-    clay = clay * 100 / total
-    sand = sand * 100 / total
-    silt = silt * 100 / total
-
-    if clay >= 40:
-        if silt >= 40:
-            return "Silty Clay"
-        if sand >= 45:
-            return "Sandy Clay"
-        return "Clay"
-    if 35 <= clay < 40:
-        if sand >= 45:
-            return "Sandy Clay"
-        if sand <= 20:
-            return "Silty Clay Loam"
-        return "Clay Loam"
-    if 27 <= clay < 35:
-        if sand >= 45:
-            return "Sandy Clay Loam"
-        if sand <= 20:
-            return "Silty Clay Loam"
-        return "Clay Loam"
-    if 20 <= clay < 27 and sand >= 45:
-        return "Sandy Clay Loam"
-    if 7 <= clay < 27 and 28 <= silt < 50 and sand < 52:
-        return "Loam"
-    if silt >= 50 and clay < 27:
-        if silt >= 80 and clay < 12:
-            return "Silt"
-        return "Silt Loam"
-    if clay < 20 and sand >= 52 and (silt + 2 * clay) > 30:
-        return "Sandy Loam"
-    if clay < 7 and 43 <= sand < 52 and silt < 50:
-        return "Sandy Loam"
-    if sand >= 85 and (silt + 1.5 * clay) < 15:
-        return "Sand"
-    if 70 <= sand < 90 and clay < 15 and (silt + 1.5 * clay) >= 15:
-        return "Loamy Sand"
-    return "Unclassified"
 
 
 def mixture_composition(folder_name):
@@ -129,6 +97,17 @@ def read_grayscale(path):
     return image
 
 
+def bounded_tanh_normalize(roi):
+    """Apply the bounded per-band mapping in Section III-E, Eqs. (3)--(5)."""
+
+    roi_float = np.asarray(roi, dtype=np.float64)
+    mean = float(np.mean(roi_float))
+    std = float(np.std(roi_float))
+    return (mean - std) + 2.0 * std * (
+        (np.tanh(TANH_KAPPA * (roi_float - mean)) + 1.0) / 2.0
+    )
+
+
 def process_specimen(specimen_dir):
     """Return all thirteen processed 100x100 bands in memory."""
     y1, y2, x1, x2 = REGION
@@ -149,15 +128,17 @@ def process_specimen(specimen_dir):
                 f"{wavelength}nm={band_image.shape}."
             )
 
+        # Paper Eq. (1): Y(lambda) = max(X(lambda) - D, 0). OpenCV's
+        # subtraction is saturated for uint8 inputs, so it implements the
+        # stated correction; an absolute difference would be incorrect.
         subtracted = cv2.subtract(band_image, base_image)
         crop = subtracted[y1:y2, x1:x2]
-        mean = float(np.mean(crop))
-        std = float(np.std(crop))
-        corrected = (mean - std) + std * (
-            np.tanh(SLOPE * (crop.astype(np.float64) - mean)) + 1.0
-        )
+        if crop.shape != (100, 100):
+            raise AssertionError(f"Configured ROI produced {crop.shape}, expected (100, 100).")
+        corrected = bounded_tanh_normalize(crop)
 
-        # Use the same uint8 array for image saving and CSV feature extraction.
+        # Reproducibility note: the original implementation extracted features
+        # from this clipped/quantized uint8 array. Preserve that numerical path.
         processed_bands[wavelength] = np.clip(corrected, 0, 255).astype(np.uint8)
 
     return processed_bands
@@ -173,7 +154,9 @@ def save_processed_images(processed_bands, output_dir, specimen_name):
             raise OSError(f"Failed to save processed image: {output_path}")
 
 
-def append_feature_rows(rows, processed_bands, clay, sand, silt, soil_type):
+def append_feature_rows(
+    rows, processed_bands, specimen_id, clay, silt, sand, soil_type
+):
     """Create 100 block-level feature rows directly from in-memory images."""
     image_height, image_width = next(iter(processed_bands.values())).shape
     if image_height % BLOCK_SIZE or image_width % BLOCK_SIZE:
@@ -182,14 +165,29 @@ def append_feature_rows(rows, processed_bands, clay, sand, silt, soil_type):
             f"by block size {BLOCK_SIZE}."
         )
 
-    for y in range(0, image_height, BLOCK_SIZE):
-        for x in range(0, image_width, BLOCK_SIZE):
-            row = [
-                float(np.mean(processed_bands[wavelength][y:y + BLOCK_SIZE, x:x + BLOCK_SIZE]))
+    before = len(rows)
+    for block_row, y in enumerate(range(0, image_height, BLOCK_SIZE)):
+        for block_column, x in enumerate(range(0, image_width, BLOCK_SIZE)):
+            row = {
+                wavelength: float(
+                    np.mean(processed_bands[wavelength][y:y + BLOCK_SIZE, x:x + BLOCK_SIZE])
+                )
                 for wavelength in WAVELENGTHS
-            ]
-            row.extend([clay, sand, silt, soil_type])
+            }
+            row.update(
+                {
+                    SPECIMEN_COLUMN: specimen_id,
+                    "Block_Row": block_row,
+                    "Block_Column": block_column,
+                    "Clay": clay,
+                    "Silt": silt,
+                    "Sand": sand,
+                    LABEL_COLUMN: soil_type,
+                }
+            )
             rows.append(row)
+    if len(rows) - before != BLOCKS_PER_SPECIMEN:
+        raise AssertionError("Each physical specimen must produce exactly 100 block rows.")
 
 
 def process_split(split_name):
@@ -205,10 +203,17 @@ def process_split(split_name):
     rows = []
     specimen_count = 0
     composition_dirs = sorted(path for path in input_dir.iterdir() if path.is_dir())
+    expected_key = "training/testing" if split_name == "Training" else "external validation"
+    expected = EXPECTED_DATASETS[expected_key]
+    if len(composition_dirs) != expected["composition_groups"]:
+        raise ValueError(
+            f"{split_name}: found {len(composition_dirs)} mixture directories; "
+            f"expected {expected['composition_groups']}."
+        )
 
     for composition_dir in composition_dirs:
         clay, sand, silt = mixture_composition(composition_dir.name)
-        soil_type = classify_usda_soil_texture(clay, sand, silt)
+        soil_type = classify_usda_texture(clay, silt, sand)
 
         for specimen_index, specimen_dir in enumerate(specimen_directories(composition_dir)):
             print(f"[{split_name}] Processing {specimen_dir}")
@@ -216,14 +221,35 @@ def process_split(split_name):
             specimen_name = (
                 f"c_{clay}_sa_{sand}_si_{silt}_{specimen_index}_0_0"
             )
+            specimen_id = (
+                f"{split_name}:{composition_dir.name}:"
+                f"{specimen_dir.relative_to(composition_dir).as_posix()}"
+            )
             save_processed_images(processed_bands, output_dir, specimen_name)
             append_feature_rows(
-                rows, processed_bands, clay, sand, silt, soil_type
+                rows, processed_bands, specimen_id, clay, silt, sand, soil_type
             )
             specimen_count += 1
 
-    columns = WAVELENGTHS + ["Clay", "Sand", "Silt", "Soil_Type"]
+    columns = WAVELENGTHS + [
+        SPECIMEN_COLUMN,
+        "Block_Row",
+        "Block_Column",
+        *TARGET_COLUMNS,
+        LABEL_COLUMN,
+    ]
     dataframe = pd.DataFrame(rows, columns=columns)
+    actual_groups = dataframe[list(TARGET_COLUMNS)].drop_duplicates()
+    if specimen_count != expected["specimens"] or len(dataframe) != expected["rows"]:
+        raise ValueError(
+            f"{split_name} is incomplete: found {specimen_count} specimens and "
+            f"{len(dataframe)} rows; expected {expected['specimens']} and {expected['rows']}."
+        )
+    if len(actual_groups) != expected["composition_groups"]:
+        raise ValueError(
+            f"{split_name}: found {len(actual_groups)} composition groups; "
+            f"expected {expected['composition_groups']}."
+        )
     csv_path = DATA_FILES_DIR / f"dataAll_Soil_Composition_{split_name}_{CSV_SUFFIX}.csv"
     dataframe.to_csv(csv_path, index=False)
 
